@@ -19,10 +19,14 @@ RPC_NODES = [
 ]
 
 def make_rpc_call(method, params):
+    """
+    Standard RPC handler with Node Rotation.
+    """
     for node in RPC_NODES:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
-            response = requests.post(node, json=payload, headers=HEADERS, timeout=15)
+            # Increased timeout to 20s for heavy queries
+            response = requests.post(node, json=payload, headers=HEADERS, timeout=20)
             if response.status_code == 200:
                 data = response.json()
                 if "result" in data:
@@ -32,7 +36,6 @@ def make_rpc_call(method, params):
     return None
 
 def get_validator_map():
-    """Downloads Validator List (Phonebook)."""
     validator_map = {}
     try:
         result = make_rpc_call("suix_getLatestSuiSystemStateV2", [])
@@ -71,12 +74,10 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     total_gas_mist = comp_cost + stor_cost - stor_rebate
     gas_fee_sui = format_sui(total_gas_mist)
 
-    # 4. DEEP ANALYSIS (Type & Amounts)
+    # 4. DEEP ANALYSIS
     tx_type = "Unknown"
     main_amount = 0.0
     recipient = "N/A"
-    
-    # This variable fills ONLY if the validator matches your search keyword
     target_amount = "N/A" 
 
     events = tx_data.get('events', [])
@@ -84,37 +85,34 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     
     is_staking_action = False
     
-    # --- CHECK EVENTS (Priority for Stake/Unstake) ---
+    # --- CHECK EVENTS (Priority) ---
     for event in events:
         e_type = event.get('type', '')
         parsed = event.get('parsedJson', {})
 
-        # A. STAKE DETECTION
+        # STAKE
         if "RequestAddStake" in e_type or "StakingRequest" in e_type:
             tx_type = "Stake"
             is_staking_action = True
             
             amount_mist = float(parsed.get('amount', 0))
-            sui_val = -format_sui(amount_mist) # Negative for Stake
+            sui_val = -format_sui(amount_mist)
             
-            # Resolve Validator Name
             val_addr = parsed.get('validator_address', '').lower()
             val_name = validator_map.get(val_addr, "Unknown Validator")
             
-            # Smart Nansen Detection (Hidden Bonus for Nansen specifically)
             if "0xa36a" in val_addr and val_name == "Unknown Validator":
                 val_name = "Nansen (Detected)"
 
             recipient = val_name
             main_amount = sui_val
             
-            # DYNAMIC FILTER: Check if the validator name contains your keyword
+            # Dynamic Target Check
             if target_keyword.lower() in val_name.lower():
                 target_amount = sui_val
-            
             break
         
-        # B. UNSTAKE DETECTION
+        # UNSTAKE
         elif "Withdraw" in e_type or "Unstake" in e_type or "UnstakingRequest" in e_type:
             tx_type = "Unstake"
             is_staking_action = True
@@ -123,11 +121,11 @@ def parse_transaction(tx_data, validator_map, target_keyword):
             r = float(parsed.get('reward_amount', 0))
             if p == 0 and r == 0: p = float(parsed.get('amount', 0))
                 
-            main_amount = format_sui(p + r) # Positive
+            main_amount = format_sui(p + r)
             recipient = "N/A"
             break
 
-    # --- BALANCE CHANGE FALLBACK (For Send/Receive) ---
+    # --- BALANCE CHANGE FALLBACK ---
     if not is_staking_action:
         sender_net_change = 0
         found_recipient = False
@@ -166,20 +164,18 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     }
 
 def fetch_batch_transactions(hashes):
+    # Try to get 10 at once
     params = [hashes, {"showEvents": True, "showBalanceChanges": True, "showInput": True, "showEffects": True}]
     return make_rpc_call("sui_multiGetTransactionBlocks", params)
 
-# --- UI ---
-st.set_page_config(page_title="Sui Unified Analyzer", page_icon="⚡", layout="wide")
-st.title("⚡ Sui Unified Analyzer (Dynamic Filter)")
+def fetch_single_transaction(tx_hash):
+    # Backup: Get 1 at a time (More reliable)
+    params = [tx_hash, {"showEvents": True, "showBalanceChanges": True, "showInput": True, "showEffects": True}]
+    return make_rpc_call("sui_getTransactionBlock", params)
 
-st.markdown("""
-**How to use:**
-1.  **Upload** your file with Transaction Hashes.
-2.  **Type the Validator Name** (e.g., 'InfStones', 'Nansen', 'Obelisk') in the box below.
-3.  The app will auto-detect **Stake/Unstake/Send** types.
-4.  The **Target Amount** column will only fill if the transaction matches your keyword.
-""")
+# --- UI ---
+st.set_page_config(page_title="Sui Complete Data Analyzer", page_icon="⚡", layout="wide")
+st.title("⚡ Sui Complete Data Analyzer")
 
 # Load Validator Map
 if 'v_map' not in st.session_state:
@@ -204,13 +200,13 @@ if uploaded_file:
         cols = df.columns.tolist()
         hash_col = st.selectbox("Transaction Hash Column", cols)
     with c2:
-        # DYNAMIC INPUT BOX
         target_keyword = st.text_input("Enter Target Validator Name (e.g., Nansen, InfStones)", value="Nansen")
     
     if st.button("🚀 Run Analysis"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
+        # Output Containers
         out_types = []
         out_amounts = []
         out_target_amounts = []
@@ -228,14 +224,30 @@ if uploaded_file:
             status_text.text(f"Processing Batch {i//BATCH_SIZE + 1}...")
             progress_bar.progress((i + 1) / len(all_hashes))
             
+            # 1. Try Batch Fetch
             batch_data = fetch_batch_transactions(batch_hashes)
+            
+            # Create Lookup
             batch_lookup = {}
             if batch_data:
                 batch_lookup = {item['digest']: item for item in batch_data if item and 'digest' in item}
             
+            # 2. Process Items (With Fallback)
             for tx_hash in batch_hashes:
+                tx_info = None
+                
+                # Option A: Found in Batch
                 if tx_hash in batch_lookup:
-                    data = parse_transaction(batch_lookup[tx_hash], v_map, target_keyword)
+                    tx_info = batch_lookup[tx_hash]
+                
+                # Option B: FALLBACK (If Batch missed it, fetch individually)
+                if not tx_info:
+                    time.sleep(0.2) # Tiny pause
+                    tx_info = fetch_single_transaction(tx_hash)
+                
+                # Parse Data
+                if tx_info:
+                    data = parse_transaction(tx_info, v_map, target_keyword)
                     out_types.append(data["Type"])
                     out_amounts.append(data["Amount"])
                     out_target_amounts.append(data["Target Amount"])
@@ -244,7 +256,7 @@ if uploaded_file:
                     out_recipients.append(data["Recipient"])
                     out_fees.append(data["Gas Fees"])
                 else:
-                    out_types.append("Error")
+                    out_types.append("Error (Invalid Hash?)")
                     out_amounts.append(0)
                     out_target_amounts.append("N/A")
                     out_times.append("N/A")
@@ -252,15 +264,12 @@ if uploaded_file:
                     out_recipients.append("N/A")
                     out_fees.append(0)
             
-            time.sleep(1)
+            time.sleep(1) # Safety pause between batches
 
         # Build DataFrame
         df["Transaction Type"] = out_types
         df["Amount (SUI)"] = out_amounts
-        
-        # DYNAMIC COLUMN HEADER based on what you typed
         df[f"Amount ({target_keyword})"] = out_target_amounts
-        
         df["Timestamp"] = out_times
         df["Sender"] = out_senders
         df["Recipient"] = out_recipients
