@@ -32,7 +32,7 @@ def make_rpc_call(method, params):
     return None
 
 def get_validator_map():
-    """Downloads Validator List (Phonebook). Returns empty dict if blocked."""
+    """Downloads Validator List (Phonebook)."""
     validator_map = {}
     try:
         result = make_rpc_call("suix_getLatestSuiSystemStateV2", [])
@@ -44,13 +44,12 @@ def get_validator_map():
     return validator_map
 
 def format_sui(mist_amount):
-    """Converts MIST to SUI"""
     if mist_amount is None: return 0.0
     return float(mist_amount) / 1_000_000_000
 
 def parse_transaction(tx_data, validator_map, target_keyword):
     """
-    Master Logic: Determines Type, Amount, and checks for Target Validator.
+    Master Logic: Determines Type, Amount, and checks for DYNAMIC Target Validator.
     """
     if not tx_data:
         return {"Type": "Network Error"}
@@ -77,7 +76,7 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     main_amount = 0.0
     recipient = "N/A"
     
-    # Special Variable: Amount SPECIFICALLY for the Target Validator (e.g., Nansen)
+    # This variable fills ONLY if the validator matches your search keyword
     target_amount = "N/A" 
 
     events = tx_data.get('events', [])
@@ -102,14 +101,14 @@ def parse_transaction(tx_data, validator_map, target_keyword):
             val_addr = parsed.get('validator_address', '').lower()
             val_name = validator_map.get(val_addr, "Unknown Validator")
             
-            # Smart Nansen Detection
+            # Smart Nansen Detection (Hidden Bonus for Nansen specifically)
             if "0xa36a" in val_addr and val_name == "Unknown Validator":
                 val_name = "Nansen (Detected)"
 
-            recipient = val_name # Recipient is the Validator
+            recipient = val_name
             main_amount = sui_val
             
-            # CHECK TARGET: Is this stake for "Nansen"?
+            # DYNAMIC FILTER: Check if the validator name contains your keyword
             if target_keyword.lower() in val_name.lower():
                 target_amount = sui_val
             
@@ -125,7 +124,7 @@ def parse_transaction(tx_data, validator_map, target_keyword):
             if p == 0 and r == 0: p = float(parsed.get('amount', 0))
                 
             main_amount = format_sui(p + r) # Positive
-            recipient = "N/A" # Unstake goes back to self
+            recipient = "N/A"
             break
 
     # --- BALANCE CHANGE FALLBACK (For Send/Receive) ---
@@ -139,7 +138,7 @@ def parse_transaction(tx_data, validator_map, target_keyword):
             
             if addr == sender:
                 net_change_mist = float(change.get('amount', 0))
-                sender_net_change = net_change_mist + total_gas_mist # Add gas back to see real transfer
+                sender_net_change = net_change_mist + total_gas_mist 
                 
             elif addr != sender and float(change.get('amount', 0)) > 0:
                 recipient = addr
@@ -158,8 +157,8 @@ def parse_transaction(tx_data, validator_map, target_keyword):
 
     return {
         "Type": tx_type,
-        "Amount": main_amount,          # The General Amount
-        "Target Amount": target_amount, # The Specific "Nansen" Amount (or N/A)
+        "Amount": main_amount,          
+        "Target Amount": target_amount, 
         "Timestamp": ts_str,
         "Sender": sender,
         "Recipient": recipient,
@@ -172,13 +171,14 @@ def fetch_batch_transactions(hashes):
 
 # --- UI ---
 st.set_page_config(page_title="Sui Unified Analyzer", page_icon="⚡", layout="wide")
-st.title("⚡ Sui Unified Analyzer (Stake + Deep Data)")
+st.title("⚡ Sui Unified Analyzer (Dynamic Filter)")
 
 st.markdown("""
-**The All-In-One Tool:**
-1.  **Auto-Detects:** Stake, Unstake, Send, Receive.
-2.  **Full Data:** Timestamp, Gas, Sender for ALL transactions.
-3.  **Validator Filter:** If you set the keyword to **"Nansen"**, it fills the `Amount (Nansen)` column **only** for Nansen stakes.
+**How to use:**
+1.  **Upload** your file with Transaction Hashes.
+2.  **Type the Validator Name** (e.g., 'InfStones', 'Nansen', 'Obelisk') in the box below.
+3.  The app will auto-detect **Stake/Unstake/Send** types.
+4.  The **Target Amount** column will only fill if the transaction matches your keyword.
 """)
 
 # Load Validator Map
@@ -189,7 +189,7 @@ if 'v_map' not in st.session_state:
 if st.session_state['v_map']:
     st.success(f"✅ Online: {len(st.session_state['v_map'])} Validators Loaded")
 else:
-    st.warning("⚠️ Offline Mode: Using Address Detection for Nansen")
+    st.warning("⚠️ Offline Mode: Phonebook blocked (Using manual detection)")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
@@ -204,13 +204,13 @@ if uploaded_file:
         cols = df.columns.tolist()
         hash_col = st.selectbox("Transaction Hash Column", cols)
     with c2:
-        target_keyword = st.text_input("Target Validator Keyword", value="Nansen")
+        # DYNAMIC INPUT BOX
+        target_keyword = st.text_input("Enter Target Validator Name (e.g., Nansen, InfStones)", value="Nansen")
     
-    if st.button("🚀 Run Unified Analysis"):
+    if st.button("🚀 Run Analysis"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Output Containers
         out_types = []
         out_amounts = []
         out_target_amounts = []
@@ -258,8 +258,7 @@ if uploaded_file:
         df["Transaction Type"] = out_types
         df["Amount (SUI)"] = out_amounts
         
-        # DYNAMIC COLUMN: "Amount (Nansen)"
-        # Only fills if the transaction is a Stake AND matches the keyword
+        # DYNAMIC COLUMN HEADER based on what you typed
         df[f"Amount ({target_keyword})"] = out_target_amounts
         
         df["Timestamp"] = out_times
