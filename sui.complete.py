@@ -19,13 +19,9 @@ RPC_NODES = [
 ]
 
 def make_rpc_call(method, params):
-    """
-    Standard RPC handler with Node Rotation.
-    """
     for node in RPC_NODES:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
-            # Increased timeout to 20s for heavy queries
             response = requests.post(node, json=payload, headers=HEADERS, timeout=20)
             if response.status_code == 200:
                 data = response.json()
@@ -46,14 +42,27 @@ def get_validator_map():
         pass
     return validator_map
 
-def format_sui(mist_amount):
+def format_amount(mist_amount):
+    """
+    Default SUI/Move Decimals = 9. 
+    (Note: Some tokens like USDC use 6, but without metadata calls we assume 9 for standardizing).
+    """
     if mist_amount is None: return 0.0
     return float(mist_amount) / 1_000_000_000
 
+def parse_token_name(coin_type):
+    """
+    Extracts 'BLUB' from '0x...::blub::BLUB'
+    """
+    if not coin_type or coin_type == "0x2::sui::SUI":
+        return "SUI"
+    try:
+        # Split by '::' and take the last part
+        return coin_type.split("::")[-1]
+    except:
+        return "Unknown Token"
+
 def parse_transaction(tx_data, validator_map, target_keyword):
-    """
-    Master Logic: Determines Type, Amount, and checks for DYNAMIC Target Validator.
-    """
     if not tx_data:
         return {"Type": "Network Error"}
 
@@ -66,17 +75,17 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     # 2. SENDER
     sender = tx_data.get('transaction', {}).get('data', {}).get('sender', 'Unknown')
 
-    # 3. GAS FEE
+    # 3. GAS FEE (Always in SUI)
     gas_used = tx_data.get('effects', {}).get('gasUsed', {})
-    comp_cost = int(gas_used.get('computationCost', 0))
-    stor_cost = int(gas_used.get('storageCost', 0))
-    stor_rebate = int(gas_used.get('storageRebate', 0))
-    total_gas_mist = comp_cost + stor_cost - stor_rebate
-    gas_fee_sui = format_sui(total_gas_mist)
+    comp = int(gas_used.get('computationCost', 0))
+    stor = int(gas_used.get('storageCost', 0))
+    rebate = int(gas_used.get('storageRebate', 0))
+    gas_fee_sui = format_amount(comp + stor - rebate)
 
-    # 4. DEEP ANALYSIS
+    # 4. CORE LOGIC
     tx_type = "Unknown"
     main_amount = 0.0
+    token_name = "SUI"  # Default
     recipient = "N/A"
     target_amount = "N/A" 
 
@@ -85,18 +94,19 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     
     is_staking_action = False
     
-    # --- CHECK EVENTS (Priority) ---
+    # --- A. CHECK EVENTS (Staking is always SUI) ---
     for event in events:
         e_type = event.get('type', '')
         parsed = event.get('parsedJson', {})
 
-        # STAKE
+        # Stake
         if "RequestAddStake" in e_type or "StakingRequest" in e_type:
             tx_type = "Stake"
             is_staking_action = True
+            token_name = "SUI"
             
             amount_mist = float(parsed.get('amount', 0))
-            sui_val = -format_sui(amount_mist)
+            sui_val = -format_amount(amount_mist)
             
             val_addr = parsed.get('validator_address', '').lower()
             val_name = validator_map.get(val_addr, "Unknown Validator")
@@ -107,55 +117,91 @@ def parse_transaction(tx_data, validator_map, target_keyword):
             recipient = val_name
             main_amount = sui_val
             
-            # Dynamic Target Check
             if target_keyword.lower() in val_name.lower():
                 target_amount = sui_val
             break
         
-        # UNSTAKE
+        # Unstake
         elif "Withdraw" in e_type or "Unstake" in e_type or "UnstakingRequest" in e_type:
             tx_type = "Unstake"
             is_staking_action = True
+            token_name = "SUI"
             
             p = float(parsed.get('principal_amount', 0))
             r = float(parsed.get('reward_amount', 0))
             if p == 0 and r == 0: p = float(parsed.get('amount', 0))
                 
-            main_amount = format_sui(p + r)
+            main_amount = format_amount(p + r)
             recipient = "N/A"
             break
 
-    # --- BALANCE CHANGE FALLBACK ---
+    # --- B. BALANCE CHANGES (For Send/Receive of ANY Token) ---
     if not is_staking_action:
-        sender_net_change = 0
-        found_recipient = False
+        # We need to find the "Main" asset that moved.
+        # Priority: Non-SUI tokens first (since SUI is also used for gas), then SUI.
         
+        primary_change = None
+        
+        # 1. Look for Non-SUI changes for the Sender
         for change in balance_changes:
             owner = change.get('owner', {})
             addr = owner.get('AddressOwner', '')
+            coin_type = change.get('coinType', '0x2::sui::SUI')
             
-            if addr == sender:
-                net_change_mist = float(change.get('amount', 0))
-                sender_net_change = net_change_mist + total_gas_mist 
+            if addr == sender and coin_type != "0x2::sui::SUI":
+                primary_change = change
+                break
+        
+        # 2. If no Non-SUI change, look for SUI change
+        if not primary_change:
+            for change in balance_changes:
+                owner = change.get('owner', {})
+                addr = owner.get('AddressOwner', '')
+                if addr == sender:
+                    primary_change = change
+                    break
+        
+        # 3. Analyze the found change
+        if primary_change:
+            raw_amount = float(primary_change.get('amount', 0))
+            coin_type = primary_change.get('coinType', '0x2::sui::SUI')
+            token_name = parse_token_name(coin_type)
+            
+            # If SUI, we must add gas back to find the true transfer amount
+            if token_name == "SUI":
+                # Convert gas fee back to MIST for accurate addition
+                gas_mist = (comp + stor - rebate)
+                net_change = raw_amount + gas_mist
+            else:
+                # If it's a Token (BLUB), gas doesn't affect the balance (gas is paid in SUI)
+                net_change = raw_amount
+            
+            # Determine Send vs Receive
+            if net_change < 0:
+                tx_type = "Send"
+                main_amount = format_amount(net_change) # Negative
                 
-            elif addr != sender and float(change.get('amount', 0)) > 0:
-                recipient = addr
-                found_recipient = True
-
-        if sender_net_change < -1000:
-            tx_type = "Send"
-            main_amount = format_sui(sender_net_change)
-        elif sender_net_change > 1000:
-            tx_type = "Receive"
-            main_amount = format_sui(sender_net_change)
-            if not found_recipient: recipient = "N/A"
-        else:
-            tx_type = "Contract Call"
-            main_amount = 0.0
+                # Find Recipient (Someone who got THIS token)
+                for change in balance_changes:
+                    owner = change.get('owner', {})
+                    addr = owner.get('AddressOwner', '')
+                    c_type = change.get('coinType', '')
+                    if addr != sender and float(change.get('amount', 0)) > 0 and c_type == coin_type:
+                        recipient = addr
+                        break
+                        
+            elif net_change > 0:
+                tx_type = "Receive"
+                main_amount = format_amount(net_change) # Positive
+                
+            else:
+                tx_type = "Contract Call"
+                main_amount = 0.0
 
     return {
         "Type": tx_type,
-        "Amount": main_amount,          
+        "Amount": main_amount,
+        "Token": token_name,    # NEW COLUMN
         "Target Amount": target_amount, 
         "Timestamp": ts_str,
         "Sender": sender,
@@ -164,12 +210,10 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     }
 
 def fetch_batch_transactions(hashes):
-    # Try to get 10 at once
     params = [hashes, {"showEvents": True, "showBalanceChanges": True, "showInput": True, "showEffects": True}]
     return make_rpc_call("sui_multiGetTransactionBlocks", params)
 
 def fetch_single_transaction(tx_hash):
-    # Backup: Get 1 at a time (More reliable)
     params = [tx_hash, {"showEvents": True, "showBalanceChanges": True, "showInput": True, "showEffects": True}]
     return make_rpc_call("sui_getTransactionBlock", params)
 
@@ -177,15 +221,14 @@ def fetch_single_transaction(tx_hash):
 st.set_page_config(page_title="Sui Complete Data Analyzer", page_icon="⚡", layout="wide")
 st.title("⚡ Sui Complete Data Analyzer")
 
-# Load Validator Map
 if 'v_map' not in st.session_state:
     with st.spinner("Loading Validator Phonebook..."):
         st.session_state['v_map'] = get_validator_map()
     
 if st.session_state['v_map']:
-    st.success(f"✅ Online: {len(st.session_state['v_map'])} Validators Loaded")
+    st.success(f"✅ Online: {len(st.session_state['v_map'])} Validators")
 else:
-    st.warning("⚠️ Offline Mode: Phonebook blocked (Using manual detection)")
+    st.warning("⚠️ Offline Mode: Using manual detection")
 
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
@@ -200,7 +243,7 @@ if uploaded_file:
         cols = df.columns.tolist()
         hash_col = st.selectbox("Transaction Hash Column", cols)
     with c2:
-        target_keyword = st.text_input("Enter Target Validator Name (e.g., Nansen, InfStones)", value="Nansen")
+        target_keyword = st.text_input("Target Validator (for Staking)", value="Nansen")
     
     if st.button("🚀 Run Analysis"):
         progress_bar = st.progress(0)
@@ -209,6 +252,7 @@ if uploaded_file:
         # Output Containers
         out_types = []
         out_amounts = []
+        out_tokens = [] # NEW
         out_target_amounts = []
         out_times = []
         out_senders = []
@@ -224,51 +268,47 @@ if uploaded_file:
             status_text.text(f"Processing Batch {i//BATCH_SIZE + 1}...")
             progress_bar.progress((i + 1) / len(all_hashes))
             
-            # 1. Try Batch Fetch
+            # Fetch
             batch_data = fetch_batch_transactions(batch_hashes)
-            
-            # Create Lookup
             batch_lookup = {}
             if batch_data:
                 batch_lookup = {item['digest']: item for item in batch_data if item and 'digest' in item}
             
-            # 2. Process Items (With Fallback)
+            # Process
             for tx_hash in batch_hashes:
                 tx_info = None
-                
-                # Option A: Found in Batch
                 if tx_hash in batch_lookup:
                     tx_info = batch_lookup[tx_hash]
-                
-                # Option B: FALLBACK (If Batch missed it, fetch individually)
                 if not tx_info:
-                    time.sleep(0.2) # Tiny pause
+                    time.sleep(0.2)
                     tx_info = fetch_single_transaction(tx_hash)
                 
-                # Parse Data
                 if tx_info:
                     data = parse_transaction(tx_info, v_map, target_keyword)
                     out_types.append(data["Type"])
                     out_amounts.append(data["Amount"])
+                    out_tokens.append(data["Token"]) # NEW
                     out_target_amounts.append(data["Target Amount"])
                     out_times.append(data["Timestamp"])
                     out_senders.append(data["Sender"])
                     out_recipients.append(data["Recipient"])
                     out_fees.append(data["Gas Fees"])
                 else:
-                    out_types.append("Error (Invalid Hash?)")
+                    out_types.append("Error")
                     out_amounts.append(0)
+                    out_tokens.append("N/A")
                     out_target_amounts.append("N/A")
                     out_times.append("N/A")
                     out_senders.append("N/A")
                     out_recipients.append("N/A")
                     out_fees.append(0)
             
-            time.sleep(1) # Safety pause between batches
+            time.sleep(1)
 
         # Build DataFrame
         df["Transaction Type"] = out_types
-        df["Amount (SUI)"] = out_amounts
+        df["Amount"] = out_amounts # Renamed from Amount (SUI)
+        df["Token"] = out_tokens   # NEW COLUMN
         df[f"Amount ({target_keyword})"] = out_target_amounts
         df["Timestamp"] = out_times
         df["Sender"] = out_senders
@@ -277,4 +317,4 @@ if uploaded_file:
         
         st.success("✅ Done!")
         st.dataframe(df)
-        st.download_button("📥 Download Master Report", df.to_csv(index=False).encode('utf-8'), "sui_unified_results.csv", "text/csv")
+        st.download_button("📥 Download Report", df.to_csv(index=False).encode('utf-8'), "sui_results_tokens.csv", "text/csv")
