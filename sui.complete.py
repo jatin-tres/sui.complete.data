@@ -43,26 +43,21 @@ def get_validator_map():
     return validator_map
 
 def format_amount(mist_amount):
-    """
-    Default SUI/Move Decimals = 9. 
-    (Note: Some tokens like USDC use 6, but without metadata calls we assume 9 for standardizing).
-    """
     if mist_amount is None: return 0.0
     return float(mist_amount) / 1_000_000_000
 
 def parse_token_name(coin_type):
-    """
-    Extracts 'BLUB' from '0x...::blub::BLUB'
-    """
-    if not coin_type or coin_type == "0x2::sui::SUI":
+    if not coin_type or "0x2::sui::SUI" in coin_type:
         return "SUI"
     try:
-        # Split by '::' and take the last part
         return coin_type.split("::")[-1]
     except:
-        return "Unknown Token"
+        return "Unknown"
 
-def parse_transaction(tx_data, validator_map, target_keyword):
+def parse_transaction(tx_data, validator_map, target_keyword, my_wallet_address):
+    """
+    Determines Type, Amount, Token, and DIRECTION based on My Wallet.
+    """
     if not tx_data:
         return {"Type": "Network Error"}
 
@@ -74,8 +69,10 @@ def parse_transaction(tx_data, validator_map, target_keyword):
 
     # 2. SENDER
     sender = tx_data.get('transaction', {}).get('data', {}).get('sender', 'Unknown')
+    sender_lower = sender.lower()
+    my_wallet_lower = my_wallet_address.strip().lower()
 
-    # 3. GAS FEE (Always in SUI)
+    # 3. GAS FEE
     gas_used = tx_data.get('effects', {}).get('gasUsed', {})
     comp = int(gas_used.get('computationCost', 0))
     stor = int(gas_used.get('storageCost', 0))
@@ -85,25 +82,28 @@ def parse_transaction(tx_data, validator_map, target_keyword):
     # 4. CORE LOGIC
     tx_type = "Unknown"
     main_amount = 0.0
-    token_name = "SUI"  # Default
+    token_name = "SUI"
     recipient = "N/A"
+    recipient_addr_raw = "" # For direction check
     target_amount = "N/A" 
+    direction = "Unknown" # NEW FIELD
 
     events = tx_data.get('events', [])
     balance_changes = tx_data.get('balanceChanges', [])
     
     is_staking_action = False
     
-    # --- A. CHECK EVENTS (Staking is always SUI) ---
+    # --- A. CHECK EVENTS (Staking) ---
     for event in events:
         e_type = event.get('type', '')
         parsed = event.get('parsedJson', {})
 
-        # Stake
+        # STAKE
         if "RequestAddStake" in e_type or "StakingRequest" in e_type:
             tx_type = "Stake"
             is_staking_action = True
             token_name = "SUI"
+            direction = "Outflow" # User Rule: Stake is Outflow
             
             amount_mist = float(parsed.get('amount', 0))
             sui_val = -format_amount(amount_mist)
@@ -121,11 +121,12 @@ def parse_transaction(tx_data, validator_map, target_keyword):
                 target_amount = sui_val
             break
         
-        # Unstake
+        # UNSTAKE
         elif "Withdraw" in e_type or "Unstake" in e_type or "UnstakingRequest" in e_type:
             tx_type = "Unstake"
             is_staking_action = True
             token_name = "SUI"
+            direction = "Inflow" # Unstake comes back to wallet
             
             p = float(parsed.get('principal_amount', 0))
             r = float(parsed.get('reward_amount', 0))
@@ -135,24 +136,20 @@ def parse_transaction(tx_data, validator_map, target_keyword):
             recipient = "N/A"
             break
 
-    # --- B. BALANCE CHANGES (For Send/Receive of ANY Token) ---
+    # --- B. BALANCE CHANGES (Send/Receive) ---
     if not is_staking_action:
-        # We need to find the "Main" asset that moved.
-        # Priority: Non-SUI tokens first (since SUI is also used for gas), then SUI.
-        
         primary_change = None
         
-        # 1. Look for Non-SUI changes for the Sender
+        # 1. Find the main asset movement
+        # Priority: Look for Non-SUI token movement for the Sender first
         for change in balance_changes:
             owner = change.get('owner', {})
             addr = owner.get('AddressOwner', '')
             coin_type = change.get('coinType', '0x2::sui::SUI')
-            
             if addr == sender and coin_type != "0x2::sui::SUI":
                 primary_change = change
                 break
         
-        # 2. If no Non-SUI change, look for SUI change
         if not primary_change:
             for change in balance_changes:
                 owner = change.get('owner', {})
@@ -161,48 +158,63 @@ def parse_transaction(tx_data, validator_map, target_keyword):
                     primary_change = change
                     break
         
-        # 3. Analyze the found change
+        # 2. Analyze
         if primary_change:
             raw_amount = float(primary_change.get('amount', 0))
             coin_type = primary_change.get('coinType', '0x2::sui::SUI')
             token_name = parse_token_name(coin_type)
             
-            # If SUI, we must add gas back to find the true transfer amount
+            # SUI Adjustment (Add Gas back to find real transfer)
             if token_name == "SUI":
-                # Convert gas fee back to MIST for accurate addition
                 gas_mist = (comp + stor - rebate)
                 net_change = raw_amount + gas_mist
             else:
-                # If it's a Token (BLUB), gas doesn't affect the balance (gas is paid in SUI)
                 net_change = raw_amount
             
-            # Determine Send vs Receive
+            # 3. Determine Type & Direction
             if net_change < 0:
                 tx_type = "Send"
-                main_amount = format_amount(net_change) # Negative
+                main_amount = format_amount(net_change)
+                direction = "Outflow"
                 
-                # Find Recipient (Someone who got THIS token)
+                # Find Recipient
                 for change in balance_changes:
                     owner = change.get('owner', {})
                     addr = owner.get('AddressOwner', '')
                     c_type = change.get('coinType', '')
                     if addr != sender and float(change.get('amount', 0)) > 0 and c_type == coin_type:
                         recipient = addr
+                        recipient_addr_raw = addr.lower()
                         break
-                        
+            
             elif net_change > 0:
                 tx_type = "Receive"
-                main_amount = format_amount(net_change) # Positive
-                
+                main_amount = format_amount(net_change)
+                direction = "Inflow"
+                recipient = sender # I am the recipient
+                recipient_addr_raw = sender_lower
+            
             else:
                 tx_type = "Contract Call"
                 main_amount = 0.0
+                direction = "Outflow" # Gas spent
+
+    # --- C. DIRECTION OVERRIDE (User Rule) ---
+    # "for non-stake: if recipient == my_address then Inflow else Outflow"
+    if not is_staking_action and my_wallet_lower:
+        if recipient_addr_raw == my_wallet_lower:
+            direction = "Inflow"
+        elif sender_lower == my_wallet_lower:
+            direction = "Outflow"
+        # If I am neither sender nor recipient, assume Outflow/Neutral?
+        # Defaulting to Outflow if money leaves sender.
 
     return {
         "Type": tx_type,
         "Amount": main_amount,
-        "Token": token_name,    # NEW COLUMN
-        "Target Amount": target_amount, 
+        "Token": token_name,
+        "Target Amount": target_amount,
+        "Direction": direction, # NEW
         "Timestamp": ts_str,
         "Sender": sender,
         "Recipient": recipient,
@@ -218,8 +230,8 @@ def fetch_single_transaction(tx_hash):
     return make_rpc_call("sui_getTransactionBlock", params)
 
 # --- UI ---
-st.set_page_config(page_title="Sui Complete Data Analyzer", page_icon="⚡", layout="wide")
-st.title("⚡ Sui Complete Data Analyzer")
+st.set_page_config(page_title="Sui Unified Analyzer", page_icon="⚡", layout="wide")
+st.title("⚡ Sui Unified Analyzer (Direction & Tokens)")
 
 if 'v_map' not in st.session_state:
     with st.spinner("Loading Validator Phonebook..."):
@@ -230,6 +242,13 @@ if st.session_state['v_map']:
 else:
     st.warning("⚠️ Offline Mode: Using manual detection")
 
+# INPUTS
+c_up1, c_up2 = st.columns(2)
+with c_up1:
+    target_keyword = st.text_input("Target Validator (for Staking)", value="Nansen")
+with c_up2:
+    my_wallet = st.text_input("Your Wallet Address (For Direction)", placeholder="0x...")
+
 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
 if uploaded_file:
@@ -238,21 +257,18 @@ if uploaded_file:
     else:
         df = pd.read_excel(uploaded_file)
     
-    c1, c2 = st.columns(2)
-    with c1:
-        cols = df.columns.tolist()
-        hash_col = st.selectbox("Transaction Hash Column", cols)
-    with c2:
-        target_keyword = st.text_input("Target Validator (for Staking)", value="Nansen")
+    cols = df.columns.tolist()
+    hash_col = st.selectbox("Transaction Hash Column", cols)
     
     if st.button("🚀 Run Analysis"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Output Containers
+        # Outputs
         out_types = []
+        out_directions = [] # NEW
         out_amounts = []
-        out_tokens = [] # NEW
+        out_tokens = []
         out_target_amounts = []
         out_times = []
         out_senders = []
@@ -284,10 +300,11 @@ if uploaded_file:
                     tx_info = fetch_single_transaction(tx_hash)
                 
                 if tx_info:
-                    data = parse_transaction(tx_info, v_map, target_keyword)
+                    data = parse_transaction(tx_info, v_map, target_keyword, my_wallet)
                     out_types.append(data["Type"])
+                    out_directions.append(data["Direction"]) # NEW
                     out_amounts.append(data["Amount"])
-                    out_tokens.append(data["Token"]) # NEW
+                    out_tokens.append(data["Token"])
                     out_target_amounts.append(data["Target Amount"])
                     out_times.append(data["Timestamp"])
                     out_senders.append(data["Sender"])
@@ -295,6 +312,7 @@ if uploaded_file:
                     out_fees.append(data["Gas Fees"])
                 else:
                     out_types.append("Error")
+                    out_directions.append("Unknown")
                     out_amounts.append(0)
                     out_tokens.append("N/A")
                     out_target_amounts.append("N/A")
@@ -307,8 +325,9 @@ if uploaded_file:
 
         # Build DataFrame
         df["Transaction Type"] = out_types
-        df["Amount"] = out_amounts # Renamed from Amount (SUI)
-        df["Token"] = out_tokens   # NEW COLUMN
+        df["Direction"] = out_directions  # NEW COLUMN
+        df["Amount"] = out_amounts
+        df["Token"] = out_tokens
         df[f"Amount ({target_keyword})"] = out_target_amounts
         df["Timestamp"] = out_times
         df["Sender"] = out_senders
@@ -317,4 +336,4 @@ if uploaded_file:
         
         st.success("✅ Done!")
         st.dataframe(df)
-        st.download_button("📥 Download Report", df.to_csv(index=False).encode('utf-8'), "sui_results_tokens.csv", "text/csv")
+        st.download_button("📥 Download Report", df.to_csv(index=False).encode('utf-8'), "sui_results_final.csv", "text/csv")
